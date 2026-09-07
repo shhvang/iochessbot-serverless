@@ -17,7 +17,7 @@ function command(text = '') {
 }
 
 async function createGame(userId, chatId) {
-  const [game] = await db.insert(games).values({ userId, chatId, fen: initialFen, history: [], flipped: false, selected: null })
+  const [game] = await db.insert(games).values({ userId, chatId, fen: initialFen, history: [], moves: [], flipped: false, selected: null })
     .returning().run();
   return game;
 }
@@ -60,7 +60,7 @@ export default async function (message) {
     return;
   }
 
-  if (action === '/start') {
+  if (action === '/start' || action === '/new') {
     await startGame(userId, chatId);
   } else if (action === '/games') {
     const list = await db.select().from(games).where(eq(games.userId, userId)).orderBy(desc(games.id)).all();

@@ -6,6 +6,7 @@ export const games = table('games', {
   chatId: integer('chat_id').notNull(),
   fen: text('fen').notNull(),
   history: json('history').notNull().default([]),
+  moves: json('moves').notNull().default([]),
   flipped: integer('flipped', { mode: 'boolean' }).notNull().default(false),
   selected: text('selected'),
   result: text('result'),

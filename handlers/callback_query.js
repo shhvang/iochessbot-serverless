@@ -1,7 +1,7 @@
 import { api, db } from 'sdk';
 import { and, desc, eq } from 'sdk/db';
 import { games } from 'schema';
-import { engine, initialFen, legalMoves, play, playMove, status } from 'lib/chess';
+import { engine, initialFen, legalMoves, moveNotation, play, playMove, status } from 'lib/chess';
 import { editBoard, editGames, sendBoard } from 'lib/reply';
 
 function action(data) {
@@ -45,6 +45,7 @@ export default async function (query) {
         chatId,
         fen: source.fen,
         history: source.history,
+        moves: source.moves || [],
         flipped: source.flipped,
         selected: null,
         result: source.result,
@@ -59,19 +60,20 @@ export default async function (query) {
   }
 
   if (selected.name === 'mv') {
-    const from = value.slice(0, 2), to = value.slice(2), fen = play(game.fen, from, to);
+    const from = value.slice(0, 2), to = value.slice(2), move = legalMoves(game.fen, from).find((item) => item.to === to), fen = move ? playMove(game.fen, move) : null;
     if (game.selected !== from || !fen) return api.answerCallbackQuery({ callback_query_id: query.id });
     const reply = engine(fen), nextFen = reply ? playMove(fen, reply) : fen;
     const history = [game.fen, ...game.history];
-    game = { ...game, fen: nextFen, history, selected: null, result: resultFor(nextFen) };
-    await db.update(games).set({ fen: game.fen, history, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
+    const moves = [...(game.moves || []), moveNotation(game.fen, move), ...(reply ? [moveNotation(fen, reply)] : [])];
+    game = { ...game, fen: nextFen, history, moves, selected: null, result: resultFor(nextFen) };
+    await db.update(games).set({ fen: game.fen, history, moves, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
     await api.answerCallbackQuery({ callback_query_id: query.id });
     return editBoard(chatId, query.message.message_id, game);
   }
 
   if (selected.name === 'sq') {
     if (game.selected) {
-      const fen = play(game.fen, game.selected, value);
+      const move = legalMoves(game.fen, game.selected).find((item) => item.to === value), fen = move ? playMove(game.fen, move) : null;
       if (!fen) {
         if (legalMoves(game.fen, value).length) {
           game = { ...game, selected: value };
@@ -85,8 +87,9 @@ export default async function (query) {
       const reply = engine(fen);
       const nextFen = reply ? playMove(fen, reply) : fen;
       const history = [game.fen, ...game.history];
-      game = { ...game, fen: nextFen, history, selected: null, result: resultFor(nextFen) };
-      await db.update(games).set({ fen: game.fen, history, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
+      const moves = [...(game.moves || []), moveNotation(game.fen, move), ...(reply ? [moveNotation(fen, reply)] : [])];
+      game = { ...game, fen: nextFen, history, moves, selected: null, result: resultFor(nextFen) };
+      await db.update(games).set({ fen: game.fen, history, moves, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
     } else if (legalMoves(game.fen, value).length) {
       game = { ...game, selected: value };
       await db.update(games).set({ selected: value }).where(eq(games.id, game.id)).run();
@@ -107,10 +110,18 @@ export default async function (query) {
   if (selected.name === 'act' && value === 'undo') {
     const history = [...game.history];
     const fen = history.shift() || initialFen;
-    game = { ...game, fen, history, selected: null, result: resultFor(fen) };
-    await db.update(games).set({ fen, history, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
+    const count = game.fen.split(' ')[1] === 'w' ? 2 : 1;
+    const moves = (game.moves || []).slice(0, -count);
+    game = { ...game, fen, history, moves, selected: null, result: resultFor(fen) };
+    await db.update(games).set({ fen, history, moves, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
     await api.answerCallbackQuery({ callback_query_id: query.id, text: 'Move undone.' });
     return editBoard(chatId, query.message.message_id, game);
+  }
+  if (selected.name === 'act' && value === 'new') {
+    await db.delete(games).where(eq(games.id, game.id)).run();
+    const [next] = await db.insert(games).values({ userId, chatId, fen: initialFen, history: [], moves: [], flipped: false, selected: null }).returning().run();
+    await api.answerCallbackQuery({ callback_query_id: query.id, text: 'New game started.' });
+    return editBoard(chatId, query.message.message_id, next);
   }
   if (selected.name === 'act' && ['finish', 'stop'].includes(value)) {
     await db.delete(games).where(eq(games.id, game.id)).run();
