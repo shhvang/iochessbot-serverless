@@ -1,136 +1,164 @@
 import { api, db } from 'sdk';
 import { and, desc, eq } from 'sdk/db';
 import { games } from 'schema';
-import { engine, initialFen, legalMoves, moveNotation, play, playMove, status } from 'lib/chess';
+import { engine, isThreefold, legalMoves, moveNotation, playMove, stateToken, status } from 'lib/chess';
 import { editBoard, editGames, sendBoard } from 'lib/reply';
+import { createGame } from 'lib/games';
 
-function action(data) {
-  const match = data?.match(/^p:([^:]+):?(.*)$/);
-  return match ? { name: match[1], value: match[2] } : null;
-}
-
-function resultFor(fen) {
-  return ({ checkmate: 'Checkmate', draw: 'Draw' }[status(fen)] ?? null);
+function gameResult(game) {
+  return game.result || ({ checkmate: 'Checkmate', draw: 'Draw' }[status(game.fen)] ?? null)
+    || (isThreefold(game.positions || [], game.fen) ? 'Draw' : null);
 }
 
 export default async function (query) {
-  const chatId = query.message?.chat?.id;
-  const userId = query.from?.id;
-  if (!chatId || !userId) return;
-  const selected = action(query.data);
-  if (!selected) return api.answerCallbackQuery({ callback_query_id: query.id });
-  if (selected.name === 'noop') return api.answerCallbackQuery({ callback_query_id: query.id });
-  if (selected.name === 'page') {
-    const page = Math.max(0, +selected.value || 0);
+  const chatId = query.message?.chat?.id, userId = query.from?.id;
+  const inlineId = query.inline_message_id;
+  if ((!chatId && !inlineId) || !userId) return;
+  const answer = (text) => api.answerCallbackQuery({ callback_query_id: query.id, ...(text ? { text } : {}) });
+  const render = (game) => editBoard(chatId, query.message?.message_id, game, inlineId);
+  const match = query.data?.match(/^p:([^:]+):?(.*)$/);
+  if (!match) return answer();
+  const [, name, payload] = match;
+  if (name === 'noop') return answer();
+  if (name === 'page') {
+    if (inlineId || query.message?.chat.type !== 'private') return answer('Open /games privately to browse.');
+    const page = Math.max(0, +payload || 0);
     const list = await db.select().from(games).where(eq(games.userId, userId)).orderBy(desc(games.id)).all();
-    const item = list[page];
-    if (!item) return api.answerCallbackQuery({ callback_query_id: query.id });
-    await api.answerCallbackQuery({ callback_query_id: query.id });
-    return editGames(chatId, query.message.message_id, { ...item, page, pageCount: list.length });
+    if (!list[page]) return answer();
+    await answer();
+    return editGames(chatId, query.message.message_id, { ...list[page], page, pageCount: list.length });
   }
-  const scoped = ['sq', 'mv', 'act'].includes(selected.name) ? selected.value.indexOf(':') : -1;
-  const gameId = scoped >= 0 ? +selected.value.slice(0, scoped) : null;
-  const value = scoped >= 0 ? selected.value.slice(scoped + 1) : selected.value;
-  let game = selected.name === 'load'
-    ? await db.select().from(games).where(and(eq(games.id, +selected.value), eq(games.userId, userId))).get()
-    : gameId
-      ? await db.select().from(games).where(and(eq(games.id, gameId), eq(games.userId, userId))).get()
-      : (await db.select().from(games).where(and(eq(games.userId, userId), eq(games.chatId, chatId))).orderBy(desc(games.id)).all())[0];
-  if (!game && gameId && query.message.chat.type !== 'private') {
+  if (name === 'load') {
+    if (inlineId || query.message?.chat.type !== 'private') return answer('Open /games privately to continue.');
+    const game = await db.select().from(games).where(and(eq(games.id, +payload), eq(games.userId, userId))).get();
+    await answer();
+    return game ? sendBoard(chatId, game) : undefined;
+  }
+  if (!['sq', 'mv', 'setup', 'promote', 'act'].includes(name)) return answer();
+  const [id, token, ...parts] = payload.split(':');
+  const gameId = +id, value = parts.join(':');
+  if (!Number.isSafeInteger(gameId) || gameId <= 0 || !token) return answer('Open your game with /games.');
+  let game = await db.select().from(games).where(and(eq(games.id, gameId), eq(games.userId, userId))).get();
+  if (!game && inlineId) return answer('This board belongs to another player. Mention @IOChessBot for your own game.');
+  if (!game && query.message?.chat.type !== 'private') {
     const source = await db.select().from(games).where(and(eq(games.id, gameId), eq(games.chatId, chatId))).get();
-    const active = await db.select().from(games).where(eq(games.userId, userId)).all();
-    if (source && active.length < 10) {
-      [game] = await db.insert(games).values({
-        userId,
-        chatId,
-        fen: source.fen,
-        history: source.history,
-        moves: source.moves || [],
-        flipped: source.flipped,
-        selected: null,
-        result: source.result,
-      }).returning().run();
-    }
+    if (!source || token !== stateToken(source)) return answer('This board is out of date.');
+    return answer('This is another player\'s game. Open the bot privately and send /new for your own board.');
   }
-  if (!game) return api.answerCallbackQuery({ callback_query_id: query.id, text: 'Start a game first.' });
-
-
-  if (game.result && selected.name !== 'act' && selected.name !== 'load') {
-    return api.answerCallbackQuery({ callback_query_id: query.id, text: `${game.result}. Finish this game first.`, show_alert: true });
+  if (!game) return answer('This game is no longer available. Open /games.');
+  if (inlineId && game.inlineMessageId !== inlineId) return answer('This game belongs to a different message.');
+  if (token !== stateToken(game)) {
+    await answer('This board is out of date.');
+    if (inlineId) return render(game);
+    return;
   }
 
-  if (selected.name === 'mv') {
-    const from = value.slice(0, 2), to = value.slice(2), move = legalMoves(game.fen, from).find((item) => item.to === to), fen = move ? playMove(game.fen, move) : null;
-    if (game.selected !== from || !fen) return api.answerCallbackQuery({ callback_query_id: query.id });
-    const reply = engine(fen), nextFen = reply ? playMove(fen, reply) : fen;
-    const history = [game.fen, ...game.history];
-    const moves = [...(game.moves || []), moveNotation(game.fen, move), ...(reply ? [moveNotation(fen, reply)] : [])];
-    game = { ...game, fen: nextFen, history, moves, selected: null, result: resultFor(nextFen) };
-    await db.update(games).set({ fen: game.fen, history, moves, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
-    await api.answerCallbackQuery({ callback_query_id: query.id });
-    return editBoard(chatId, query.message.message_id, game);
-  }
+  const original = game;
+  const result = gameResult(game);
+  let patch = {}, notice;
+  if (result && (name !== 'act' || !['flip', 'new', 'stop', 'finish'].includes(value))) return answer(`${result}. Start a rematch instead.`);
+  if (game.setup?.pending && name !== 'setup' && !(name === 'act' && ['stop', 'finish'].includes(value))) return answer('Choose your side and difficulty first.');
 
-  if (selected.name === 'sq') {
-    if (game.selected) {
-      const move = legalMoves(game.fen, game.selected).find((item) => item.to === value), fen = move ? playMove(game.fen, move) : null;
-      if (!fen) {
-        if (legalMoves(game.fen, value).length) {
-          game = { ...game, selected: value };
-          await db.update(games).set({ selected: value }).where(eq(games.id, game.id)).run();
-          await api.answerCallbackQuery({ callback_query_id: query.id });
-          return editBoard(chatId, query.message.message_id, game);
-        }
-        await api.answerCallbackQuery({ callback_query_id: query.id, text: 'That move is not legal.', show_alert: true });
-        return;
+  if (name === 'setup') {
+    if (!game.setup?.pending) return answer();
+    const setup = { ...game.setup };
+    if (['w', 'b', 'r'].includes(value)) setup.playerColor = value;
+    else if (['easy', 'normal', 'hard'].includes(value)) setup.difficulty = value;
+    else return answer();
+    patch = { setup };
+    if (setup.playerColor && setup.difficulty) {
+      const playerColor = setup.playerColor === 'r' ? (Math.random() < 0.5 ? 'w' : 'b') : setup.playerColor;
+      patch = { playerColor, difficulty: setup.difficulty, flipped: playerColor === 'b', setup: {}, history: [] };
+      if (playerColor === 'b') {
+        const reply = engine(game.fen, setup.difficulty);
+        const fen = playMove(game.fen, reply);
+        patch = { ...patch, fen, moves: [moveNotation(game.fen, reply)], positions: [game.fen, fen] };
       }
-      const reply = engine(fen);
-      const nextFen = reply ? playMove(fen, reply) : fen;
-      const history = [game.fen, ...game.history];
-      const moves = [...(game.moves || []), moveNotation(game.fen, move), ...(reply ? [moveNotation(fen, reply)] : [])];
-      game = { ...game, fen: nextFen, history, moves, selected: null, result: resultFor(nextFen) };
-      await db.update(games).set({ fen: game.fen, history, moves, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
-    } else if (legalMoves(game.fen, value).length) {
-      game = { ...game, selected: value };
-      await db.update(games).set({ selected: value }).where(eq(games.id, game.id)).run();
-    } else {
-      await api.answerCallbackQuery({ callback_query_id: query.id, text: 'Choose one of your pieces.', show_alert: true });
-      return;
     }
-    await api.answerCallbackQuery({ callback_query_id: query.id });
-    return editBoard(chatId, query.message.message_id, game);
+  } else if (['sq', 'mv', 'promote'].includes(name)) {
+    if (game.fen.split(' ')[1] !== game.playerColor) return answer('Wait for the engine to move.');
+    let from, to, promotion;
+    if (name === 'promote') {
+      if (!game.promotion || !['q', 'r', 'b', 'n'].includes(value)) return answer();
+      [from, to] = game.promotion.split(':');
+      promotion = value;
+    } else {
+      if (game.promotion) return answer('Choose a promotion piece first.');
+      from = name === 'mv' ? value.slice(0, 2) : game.selected;
+      to = name === 'mv' ? value.slice(2) : value;
+      if (!/^[a-h][1-8]$/.test(to) || (from && !/^[a-h][1-8]$/.test(from))) return answer();
+      if (name === 'mv' && game.selected !== from) return answer();
+    }
+    const move = from && legalMoves(game.fen, from).find((item) => item.to === to && (!promotion || item.promotion?.toLowerCase() === promotion));
+    if (!move) {
+      if (name !== 'sq' || !legalMoves(game.fen, to).length) return answer('Choose one of your pieces, then a legal destination.');
+      patch = { selected: game.selected === to ? null : to };
+    } else if (move.promotion && !promotion) {
+      patch = { promotion: `${from}:${to}`, selected: null };
+    } else {
+      const fen = playMove(game.fen, move);
+      if (game.mode === 'puzzle') {
+        if (status(fen) !== 'checkmate') {
+          patch = { selected: null, promotion: null };
+          notice = 'Not checkmate. Try another move.';
+        } else {
+          patch = { fen, positions: [game.fen, fen], moves: [moveNotation(game.fen, move)], selected: null, promotion: null, result: 'Solved' };
+          notice = 'Checkmate! Puzzle solved.';
+        }
+      } else {
+        const positions = [...(game.positions?.length ? game.positions : [game.fen]), fen];
+        const humanResult = gameResult({ fen, positions });
+        const reply = humanResult ? null : engine(fen, game.difficulty);
+        const nextFen = reply ? playMove(fen, reply) : fen;
+        if (reply) positions.push(nextFen);
+        patch = {
+          fen: nextFen, positions, history: [game.fen, ...(game.history || [])],
+          moves: [...(game.moves || []), moveNotation(game.fen, move), ...(reply ? [moveNotation(fen, reply)] : [])],
+          selected: null, promotion: null, result: humanResult || gameResult({ fen: nextFen, positions }),
+        };
+      }
+    }
+  } else if (name === 'act') {
+    if (value === 'flip') patch = { flipped: !game.flipped };
+    else if (value === 'undo') {
+      if (game.mode === 'puzzle') return answer('Find checkmate in one move.');
+      const [fen, ...history] = game.history || [];
+      if (!fen || fen.split(' ')[1] !== game.playerColor) return answer('Nothing to undo.');
+      const positions = game.positions?.length ? game.positions : [game.fen];
+      const index = positions.lastIndexOf(fen, positions.length - 2);
+      const count = index >= 0 ? positions.length - index - 1 : 2;
+      patch = { fen, history, moves: (game.moves || []).slice(0, -count), positions: index >= 0 ? positions.slice(0, index + 1) : [fen], selected: null, promotion: null };
+      notice = 'Move undone.';
+    } else if (['resign', 'finish', 'stop'].includes(value)) {
+      const played = (game.moves?.length || 0) > (game.playerColor === 'b' ? 1 : 0);
+      patch = { result: result || (game.mode === 'puzzle' ? 'Skipped' : played || value === 'resign' ? 'Resigned' : 'Cancelled'), setup: {}, selected: null, promotion: null };
+      notice = 'Game finished. Final board saved.';
+    } else if (value === 'draw') return answer('Draw offers are not available against the computer.');
+    else if (value === 'cancel-promotion') patch = { promotion: null, selected: null };
+    else if (value === 'new') {
+      if (!result) return answer('Finish this game first.');
+      if (inlineId) return answer('Mention @IOChessBot again for a new game or puzzle.');
+      const list = await db.select().from(games).where(eq(games.userId, userId)).all();
+      if (list.filter((item) => !gameResult(item)).length >= 10) return answer('Finish an active game first.');
+      const revision = (game.revision || 0) + 1;
+      const claimed = await db.update(games).set({ revision }).where(and(eq(games.id, game.id), eq(games.revision, game.revision || 0))).returning().run();
+      if (!claimed.length) return answer('A rematch was already requested. Open /games.');
+      const next = await createGame(userId, chatId, game.mode || 'classic');
+      if (!next) return answer('Finish an active game first.');
+      await answer('New game started.');
+      await render({ ...game, revision });
+      return sendBoard(chatId, next);
+    } else return answer();
   }
 
-  if (selected.name === 'act' && value === 'flip') {
-    game = { ...game, flipped: !game.flipped };
-    await db.update(games).set({ flipped: game.flipped }).where(eq(games.id, game.id)).run();
-    await api.answerCallbackQuery({ callback_query_id: query.id });
-    return editBoard(chatId, query.message.message_id, game);
+  if (!original.result && patch.result) {
+    patch.outcome = patch.result === 'Solved' ? 'solved' : patch.result === 'Draw' ? 'draw' : patch.result === 'Resigned' ? 'loss'
+      : patch.result === 'Checkmate' ? ((patch.fen || game.fen).split(' ')[1] === game.playerColor ? 'loss' : 'win') : null;
   }
-  if (selected.name === 'act' && value === 'undo') {
-    const history = [...game.history];
-    const fen = history.shift() || initialFen;
-    const count = game.fen.split(' ')[1] === 'w' ? 2 : 1;
-    const moves = (game.moves || []).slice(0, -count);
-    game = { ...game, fen, history, moves, selected: null, result: resultFor(fen) };
-    await db.update(games).set({ fen, history, moves, selected: null, result: game.result }).where(eq(games.id, game.id)).run();
-    await api.answerCallbackQuery({ callback_query_id: query.id, text: 'Move undone.' });
-    return editBoard(chatId, query.message.message_id, game);
-  }
-  if (selected.name === 'act' && value === 'new') {
-    await db.delete(games).where(eq(games.id, game.id)).run();
-    const [next] = await db.insert(games).values({ userId, chatId, fen: initialFen, history: [], moves: [], flipped: false, selected: null }).returning().run();
-    await api.answerCallbackQuery({ callback_query_id: query.id, text: 'New game started.' });
-    return editBoard(chatId, query.message.message_id, next);
-  }
-  if (selected.name === 'act' && ['finish', 'stop'].includes(value)) {
-    await db.delete(games).where(eq(games.id, game.id)).run();
-    await api.answerCallbackQuery({ callback_query_id: query.id, text: 'Game finished.' });
-    return api.editMessageText({ chat_id: chatId, message_id: query.message.message_id, text: 'Game finished.' });
-  }
-  if (selected.name === 'load') {
-    await api.answerCallbackQuery({ callback_query_id: query.id });
-    return sendBoard(chatId, game);
-  }
-  await api.answerCallbackQuery({ callback_query_id: query.id });
+  patch.revision = (original.revision || 0) + 1;
+  const saved = await db.update(games).set(patch).where(and(eq(games.id, game.id), eq(games.revision, original.revision || 0))).returning().run();
+  if (!saved.length) return answer('This board changed. Open the latest game.');
+  game = { ...game, ...patch };
+  await answer(notice);
+  return render(game);
 }
